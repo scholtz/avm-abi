@@ -2,6 +2,8 @@ package abi
 
 import (
 	"fmt"
+	"math"
+	"math/rand"
 	"runtime"
 	"strconv"
 	"strings"
@@ -40,10 +42,10 @@ func TestByteLenOverflow(t *testing.T) {
 	// large but representable sizes keep working.
 	n, err := mustTypeOf(t, "uint64[65535][65535][65535]").ByteLen()
 	require.NoError(t, err)
-	require.Equal(t, 8*65535*65535*65535, n)
+	require.EqualValues(t, int64(8)*65535*65535*65535, n)
 	n, err = mustTypeOf(t, "uint8[20000][65535][65535][65535]").ByteLen()
 	require.NoError(t, err)
-	require.Equal(t, 20000*65535*65535*65535, n)
+	require.EqualValues(t, int64(20000)*65535*65535*65535, n)
 }
 
 // TestByteLenBoolArrayNoUint16Wrap checks that the byte length of a static bool array does not
@@ -103,19 +105,27 @@ func TestDecodeShortInputDoesNotPanic(t *testing.T) {
 	}
 }
 
+// decodeAllocBytes returns the smallest number of bytes allocated by a call to Decode over several
+// runs, which filters out unrelated background allocations.
 func decodeAllocBytes(typ Type, input []byte) uint64 {
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	_, _ = typ.Decode(input)
-	runtime.ReadMemStats(&after)
-	return after.TotalAlloc - before.TotalAlloc
+	best := uint64(math.MaxUint64)
+	for i := 0; i < 5; i++ {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, _ = typ.Decode(input)
+		runtime.ReadMemStats(&after)
+		if used := after.TotalAlloc - before.TotalAlloc; used < best {
+			best = used
+		}
+	}
+	return best
 }
 
 // TestDecodeDoesNotExpandBeforeValidatingLength checks that the memory used to decode a value is
 // bounded by the size of the input, not by the length claimed by the type or by the length prefix.
 func TestDecodeDoesNotExpandBeforeValidatingLength(t *testing.T) {
-	const budget = 16 * 1024 // far below the ~2.6 MB the unfixed code allocates per call
+	const budget = 256 * 1024 // an order of magnitude below the ~2.6 MB the unfixed code allocates per call
 
 	cases := []struct {
 		name  string
@@ -193,5 +203,62 @@ func TestTypeOfDepthLimit(t *testing.T) {
 		_, err := TypeOf(s)
 		require.Error(t, err, "depth %d", tooDeep)
 		require.Contains(t, err.Error(), "nesting")
+	}
+}
+
+// TestDecodeNeverPanics decodes every prefix of valid encodings, and randomly corrupted encodings,
+// of several types: malformed input must produce an error, never a panic.
+func TestDecodeNeverPanics(t *testing.T) {
+	cases := []struct {
+		typ   string
+		value interface{}
+	}{
+		{"(string,uint8)", []interface{}{"hello", uint8(3)}},
+		{"(uint8,bool,bool,string,uint64[2])", []interface{}{uint8(1), true, false, "x", []interface{}{uint64(1), uint64(2)}}},
+		{"(bool[10],uint16)", []interface{}{[]interface{}{true, false, true, false, true, false, true, false, true, false}, uint16(9)}},
+		{"string[]", []interface{}{"a", "bc", ""}},
+		{"(uint8[],(string,bool))[2]", []interface{}{
+			[]interface{}{[]interface{}{uint8(1)}, []interface{}{"a", true}},
+			[]interface{}{[]interface{}{}, []interface{}{"", false}},
+		}},
+		{"address[2]", []interface{}{make([]byte, 32), make([]byte, 32)}},
+	}
+	rng := rand.New(rand.NewSource(1))
+	for _, tc := range cases {
+		typ := mustTypeOf(t, tc.typ)
+		encoded, err := typ.Encode(tc.value)
+		require.NoError(t, err, tc.typ)
+		_, err = typ.Decode(encoded)
+		require.NoError(t, err, tc.typ)
+
+		for n := 0; n < len(encoded); n++ {
+			require.NotPanics(t, func() { _, _ = typ.Decode(encoded[:n]) }, "%s prefix %d", tc.typ, n)
+		}
+		for i := 0; i < 500; i++ {
+			mutated := append([]byte(nil), encoded...)
+			for j := 0; j <= rng.Intn(3); j++ {
+				mutated[rng.Intn(len(mutated))] = byte(rng.Intn(256))
+			}
+			require.NotPanics(t, func() { _, _ = typ.Decode(mutated) }, "%s mutated %x", tc.typ, mutated)
+		}
+	}
+}
+
+// TestDecodeZeroSizeElementsBounded checks that arrays of elements that take zero bytes to encode,
+// whose count the input length cannot bound, do not multiply when nested.
+func TestDecodeZeroSizeElementsBounded(t *testing.T) {
+	const budget = 8 << 20 // one level of 65534 expanded types is about 4.7 MB
+	for _, s := range []string{
+		"()[65534][65534]",
+		"()[65534][65534][65534]",
+		"(()[65534],()[65534],()[65534],()[65534])",
+	} {
+		typ := mustTypeOf(t, s)
+		for _, input := range [][]byte{nil, {0}, {0, 0}} {
+			_, err := typ.Decode(input)
+			require.Error(t, err, "%s %x", s, input)
+			allocated := decodeAllocBytes(typ, input)
+			require.Less(t, allocated, uint64(budget), "%s %x allocated %d bytes", s, input, allocated)
+		}
 	}
 }

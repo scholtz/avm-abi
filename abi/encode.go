@@ -54,29 +54,36 @@ func (t Type) typeCastToTuple(tupLen ...int) (Type, error) {
 
 // minArrayEncodedLen returns a lower bound on the number of bytes needed to encode n elements of
 // type elem, laid out as a tuple of n elem types (the encoding of both static and dynamic arrays,
-// excluding the length prefix of dynamic arrays). The second return value is false if the bound
-// does not fit in an int.
-func minArrayEncodedLen(elem Type, n int) (int, bool) {
+// excluding the length prefix of dynamic arrays).
+func minArrayEncodedLen(elem Type, n int) (int, error) {
 	switch {
 	case elem.kind == Bool:
-		return (n + 7) / 8, true
+		return (n + 7) / 8, nil
 	case elem.IsDynamic():
 		// every dynamic element has at least a 2 byte offset in the head
-		return mulInt(n, lengthEncodeByteSize)
+		return n * lengthEncodeByteSize, nil
 	default:
 		elemLen, err := elem.ByteLen()
 		if err != nil {
-			return 0, false
+			return 0, err
 		}
-		return mulInt(n, elemLen)
+		minLen, ok := mulInt(n, elemLen)
+		if !ok {
+			return 0, fmt.Errorf("%s[%d]: byte length overflows int", elem.String(), n)
+		}
+		return minLen, nil
 	}
 }
 
-// checkArrayInputLen returns an error if encoded is too short to hold n elements of type elem. It
-// is used to reject malformed input before allocating memory proportional to n.
+// checkArrayInputLen is called before an array of n elements of type elem is expanded into a tuple
+// type to decode encoded. It returns an error if encoded is too short to hold n elements, which
+// keeps the memory spent decoding proportional to the size of the input.
 func checkArrayInputLen(elem Type, n int, encoded []byte) error {
-	minLen, ok := minArrayEncodedLen(elem, n)
-	if !ok || len(encoded) < minLen {
+	minLen, err := minArrayEncodedLen(elem, n)
+	if err != nil {
+		return err
+	}
+	if len(encoded) < minLen {
 		return fmt.Errorf("input byte not enough to decode %d elements of type %s", n, elem.String())
 	}
 	return nil

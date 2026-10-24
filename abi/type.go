@@ -107,6 +107,8 @@ var ufixedRegexp = regexp.MustCompile(`^ufixed([1-9][\d]*)x([1-9][\d]*)$`)
 // TypeOf parses an ABI type string.
 // For example: `TypeOf("(uint64,byte[])")`
 //
+// Types nested more than 256 levels deep (arrays and tuples) are rejected with an error.
+//
 // Note: this function only supports "basic" ABI types. Reference types and transaction types are
 // not supported and will produce an error.
 func TypeOf(str string) (Type, error) {
